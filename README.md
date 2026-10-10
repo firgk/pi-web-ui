@@ -69,6 +69,7 @@ Environment variables (set before starting Pi):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PI_WEB_UI_PORT` | `3001` | Server port |
+| `PI_WEB_UI_PASSWORD` | *(unset)* | Password for login; required when binding outside loopback |
 | `PI_WEB_UI_HOST` | `127.0.0.1` | Bind address |
 | `PI_WEB_UI_DISABLED` | `0` | Set to `1` to disable |
 | `PI_WEB_UI_STATIC_DIR` | *(bundled)* | Override static files path |
@@ -104,7 +105,17 @@ PI_WEB_UI_DISABLED=1 pi
 
 ## Security
 
-Pi Web UI binds to `127.0.0.1` by default — accessible only from your local machine. For remote access, use `tailscale serve` or a reverse proxy with TLS. There is no built-in authentication; it's unnecessary for local-only access and insecure over cleartext.
+Pi Web UI binds to `127.0.0.1` by default — accessible only from your local machine. For remote access, use `tailscale serve` or a reverse proxy with TLS. This fork includes password authentication. If binding outside loopback, `PI_WEB_UI_PASSWORD` is mandatory and unauthenticated HTTP and WebSocket clients are rejected. Serve it behind HTTPS for remote access.
+
+### Password-protected deployment
+
+```bash
+PI_WEB_UI_HOST=0.0.0.0 PI_WEB_UI_PORT=7069 PI_WEB_UI_PASSWORD='replace-with-a-long-random-password' pi
+```
+
+Pi Web UI starts automatically; open `https://your-domain/` through a TLS reverse proxy. The login form issues an HttpOnly session cookie valid for seven days or until Pi restarts. Use `POST /auth/logout` to end that browser session. Five failed login attempts per IP trigger a fifteen-minute lockout. Keep `PI_WEB_UI_HOST=127.0.0.1` when testing over direct SSH port forwarding.
+
+**Important:** Exposing port 7069 via plain HTTP is not safe: the password and session cookie can be intercepted. Use a TLS reverse proxy or VPN, and limit proxy access as appropriate.
 
 ## How it works
 
