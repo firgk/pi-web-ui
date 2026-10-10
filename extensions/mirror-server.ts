@@ -10,6 +10,7 @@
  * - Sends full state snapshot on client connect (messages, model, etc.)
  */
 
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
@@ -166,6 +167,53 @@ const SETTINGS = loadSettings();
 const PORT = SETTINGS.port;
 const HOST = SETTINGS.host;
 const AUTO_START = SETTINGS.autoStart;
+const AUTH_PASSWORD = process.env.PI_WEB_UI_PASSWORD || "";
+// Never expose this browser control plane publicly without authentication.
+if (HOST !== "127.0.0.1" && HOST !== "localhost" && HOST !== "::1" && !AUTH_PASSWORD) {
+  throw new Error("PI_WEB_UI_PASSWORD is required for non-loopback binding");
+}
+const SESSION_COOKIE = "pi_web_ui_session";
+const SESSION_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
+const sessionTokens = new Map<string, number>();
+const attempts = new Map<string, { count: number; until: number }>();
+
+function samePassword(candidate: string): boolean {
+  const a = createHash("sha256").update(candidate).digest();
+  const b = createHash("sha256").update(AUTH_PASSWORD).digest();
+  return timingSafeEqual(a, b);
+}
+function cookies(req: http.IncomingMessage): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const item of (req.headers.cookie || "").split(";")) {
+    const index = item.indexOf("=");
+    if (index > 0) result[item.slice(0, index).trim()] = item.slice(index + 1).trim();
+  }
+  return result;
+}
+function authenticated(req: http.IncomingMessage): boolean {
+  if (!AUTH_PASSWORD) return true;
+  const token = cookies(req)[SESSION_COOKIE] || "";
+  const expiry = sessionTokens.get(token);
+  if (!token || !expiry) return false;
+  if (expiry < Date.now()) { sessionTokens.delete(token); return false; }
+  return true;
+}
+function cookieHeader(req: http.IncomingMessage, value: string, maxAge: number): string {
+  // Only trust forwarded-proto when deploying behind a known, controlled reverse proxy.
+  const secure = (req.socket as typeof req.socket & { encrypted?: boolean }).encrypted === true ||
+    req.headers["x-forwarded-proto"] === "https";
+  return `${SESSION_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${secure ? "; Secure" : ""}`;
+}
+function validOrigin(req: http.IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (!origin) return true; // Non-browser HTTP callers still require a valid session.
+  try {
+    const parsed = new URL(origin);
+    return parsed.host === req.headers.host && (parsed.protocol === "https:" || parsed.protocol === "http:");
+  } catch { return false; }
+}
+const loginHtml = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pi Web UI - 登录</title><style>body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;display:grid;place-items:center;min-height:100vh;margin:0}.card{width:min(360px,calc(100vw - 64px));background:#161b22;border:1px solid #30363d;padding:30px;border-radius:14px}h1{font-size:22px;margin:0 0 8px}p{color:#8b949e}input,button{box-sizing:border-box;width:100%;font:inherit;padding:12px;border-radius:8px}input{background:#0d1117;color:white;border:1px solid #444;margin:14px 0}button{background:#238636;color:white;border:0;cursor:pointer}.error{color:#ff7b72;min-height:22px}</style></head><body><div class="card"><h1>Pi Web UI</h1><p>请输入访问密码</p><form method="POST" action="/auth/login"><input type="password" name="password" placeholder="访问密码" autocomplete="current-password" required autofocus><button type="submit">登录</button></form><p class="error" id="error"></p></div><script>if(new URLSearchParams(location.search).has('error'))document.getElementById('error').textContent='密码错误或尝试过于频繁';</script></body></html>`;
+
 const MAX_FILE_CONTENT_BYTES = 1024 * 1024;
 const MAX_GIT_OUTPUT_BYTES = 10 * 1024 * 1024;
 const ARTIFACT_TOOL_NAMES = new Set(["edit", "write"]);
@@ -981,6 +1029,51 @@ export default function (pi: ExtensionAPI) {
   // Static file server
   // ═══════════════════════════════════════
   function serveStaticFile(req: http.IncomingMessage, res: http.ServerResponse) {
+    res.setHeader("Cache-Control", "no-store");
+    if (AUTH_PASSWORD) {
+      if (req.url === "/auth/login" && req.method === "POST") {
+        if (!validOrigin(req)) { res.writeHead(403); res.end("Forbidden"); return; }
+        const ip = req.socket.remoteAddress || "unknown";
+        const record = attempts.get(ip);
+        if (record && record.count >= 5 && record.until > Date.now()) {
+          res.writeHead(429); res.end("Too many attempts"); return;
+        }
+        let body = "";
+        req.on("data", (chunk: Buffer) => {
+          body += chunk.toString("utf8");
+          if (body.length > 4096) req.destroy();
+        });
+        req.on("end", () => {
+          const password = new URLSearchParams(body).get("password") || "";
+          if (!samePassword(password)) {
+            const current = attempts.get(ip);
+            const count = current && current.until > Date.now() ? current.count + 1 : 1;
+            attempts.set(ip, { count, until: Date.now() + 15 * 60 * 1000 });
+            res.writeHead(303, { Location: "/auth/login?error=1" }); res.end(); return;
+          }
+          attempts.delete(ip);
+          const token = randomBytes(32).toString("hex");
+          sessionTokens.set(token, Date.now() + SESSION_LIFETIME_MS);
+          res.writeHead(303, { "Set-Cookie": cookieHeader(req, token, SESSION_LIFETIME_MS / 1000), Location: "/" });
+          res.end();
+        });
+        return;
+      }
+      if (req.url === "/auth/logout" && req.method === "POST") {
+        if (!validOrigin(req) || !authenticated(req)) { res.writeHead(403); res.end("Forbidden"); return; }
+        sessionTokens.delete(cookies(req)[SESSION_COOKIE] || "");
+        res.writeHead(303, { "Set-Cookie": cookieHeader(req, "", 0), Location: "/auth/login" }); res.end();
+        return;
+      }
+      if ((req.url || "").startsWith("/auth/login") && req.method === "GET") {
+        if (authenticated(req)) { res.writeHead(303, { Location: "/" }); res.end(); return; }
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" }); res.end(loginHtml); return;
+      }
+      if (!authenticated(req)) {
+        res.writeHead(303, { Location: "/auth/login" }); res.end(); return;
+      }
+    }
+
     let urlPath = req.url || "/";
 
     // Strip query params
@@ -1361,6 +1454,12 @@ export default function (pi: ExtensionAPI) {
     wss = new WebSocketServer({ noServer: true });
 
     server.on("upgrade", (request, socket, head) => {
+      if (!authenticated(request) || !validOrigin(request)) {
+        socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+
       if (request.url === "/ws") {
         const activeWss = wss;
         if (!activeWss) {
